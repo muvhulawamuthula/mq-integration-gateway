@@ -1,0 +1,35 @@
+spring:
+  application:
+    name: mq-integration-gateway
+  profiles:
+    # 'dev' runs on an in-process Artemis broker so the gateway starts with zero external setup.
+    # Activate 'mq' in production to target IBM MQ instead.
+    active: dev
+
+gateway:
+  queues:
+    inbound: PACS008.IN
+    reply: PACS002.OUT
+    dead-letter: DLQ
+  processor:
+    base-url: http://localhost:8080
+    path: /api/v1/payments/pacs008
+  concurrency: "1-5"
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, metrics, prometheus
+  metrics:
+    tags:
+      application: mq-integration-gateway
+
+server:
+  port: 8081
+
+logging:
+  # Carry the inbound JMS message id on every log line via MDC, so one message is traceable
+  # across the forward -> reply / dead-letter hops.
+  pattern:
+    console: "%d{HH:mm:ss.SSS} %-5level [jmsMsgId=%X{jmsMsgId:-}] %logger{36} - %msg%n"

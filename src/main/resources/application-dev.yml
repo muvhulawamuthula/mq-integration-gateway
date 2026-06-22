@@ -1,0 +1,12 @@
+# Local development: an embedded ActiveMQ Artemis broker, no external MQ required.
+spring:
+  # IBM MQ is on the classpath for production; keep its auto-configuration off here so it does not
+  # try to create a second ConnectionFactory alongside the embedded broker.
+  autoconfigure:
+    exclude: com.ibm.mq.spring.boot.MQAutoConfiguration
+  artemis:
+    mode: embedded
+    embedded:
+      enabled: true
+      # Pre-create the queues so producers/consumers bind immediately on startup.
+      queues: PACS008.IN,PACS002.OUT,DLQ

@@ -1,0 +1,16 @@
+# Production: IBM MQ. The same listener/publisher code runs unchanged — only the ConnectionFactory
+# differs. Disable the embedded Artemis auto-configuration so IBM MQ provides the ConnectionFactory.
+spring:
+  autoconfigure:
+    exclude: org.springframework.boot.autoconfigure.jms.artemis.ArtemisAutoConfiguration
+
+ibm:
+  mq:
+    queue-manager: ${MQ_QMGR:QM1}
+    channel: ${MQ_CHANNEL:DEV.APP.SVRCONN}
+    conn-name: ${MQ_CONN_NAME:localhost(1414)}
+    user: ${MQ_APP_USER:app}
+    password: ${MQ_APP_PASSWORD:}
+    # Note: configure the inbound queue on the queue manager with a backout threshold and backout
+    # requeue name so poison messages are moved aside automatically, e.g.:
+    #   ALTER QLOCAL(PACS008.IN) BOTHRESH(3) BOQNAME(DLQ)
