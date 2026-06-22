@@ -1,0 +1,73 @@
+name: iso20022-payments-demo
+
+# End-to-end demo: IBM MQ + the payment processor + this gateway.
+#
+#   pacs.008 -> (PACS008.IN on IBM MQ) -> gateway -> HTTP -> processor
+#            -> pacs.002 -> (PACS002.OUT on IBM MQ)        failures -> (DLQ)
+#
+# Assumes the companion processor repo is a sibling directory (../iso20022-processor).
+# Bring it up with:  docker compose up --build
+services:
+
+  ibmmq:
+    image: icr.io/ibm-messaging/mq:latest
+    container_name: ibmmq
+    environment:
+      LICENSE: accept
+      MQ_QMGR_NAME: QM1
+      # Enables the 'app' user on DEV.APP.SVRCONN with this password.
+      MQ_APP_PASSWORD: passw0rd
+      MQ_ADMIN_PASSWORD: passw0rd
+    ports:
+      - "1414:1414"   # MQ listener
+      - "9443:9443"   # MQ web console (https://localhost:9443/ibmmq/console, admin/passw0rd)
+    volumes:
+      # Applied at start-up: defines the payment queues and grants the app user access.
+      - ./mq/payments.mqsc:/etc/mqm/payments.mqsc:ro
+      - ./demo:/demo:ro
+    healthcheck:
+      test: ["CMD", "chkmqhealthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 24
+      start_period: 40s
+
+  processor:
+    build:
+      context: ../iso20022-processor
+    container_name: processor
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "bash", "-c", ":</dev/tcp/localhost/8080"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+
+  gateway:
+    build:
+      context: .
+    container_name: gateway
+    depends_on:
+      ibmmq:
+        condition: service_healthy
+      processor:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: mq
+      MQ_QMGR: QM1
+      MQ_CHANNEL: DEV.APP.SVRCONN
+      MQ_CONN_NAME: ibmmq(1414)
+      MQ_APP_USER: app
+      MQ_APP_PASSWORD: passw0rd
+      # Point the gateway at the processor service on the compose network.
+      SPRING_APPLICATION_JSON: '{"gateway":{"processor":{"base-url":"http://processor:8080"}}}'
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD", "bash", "-c", ":</dev/tcp/localhost/8081"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 40s

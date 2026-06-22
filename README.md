@@ -89,6 +89,41 @@ ALTER QLOCAL(PACS008.IN) BOTHRESH(3) BOQNAME(DLQ)
 
 ---
 
+## End-to-end demo with real IBM MQ (`docker compose`)
+
+`docker-compose.yml` stands up the whole chain — **IBM MQ**, the **processor**, and the **gateway**
+running on the `mq` profile — and wires them together. It assumes the companion processor repo is a
+sibling directory (`../iso20022-processor`).
+
+```bash
+docker compose up --build      # starts ibmmq, processor, gateway (gateway waits for both to be healthy)
+```
+
+`mq/payments.mqsc` is applied to the queue manager at start-up: it creates `PACS008.IN`,
+`PACS002.OUT`, and `DLQ` and grants the `app` user access.
+
+**Drive it** — put a pacs.008 on the inbound queue and read the pacs.002 reply, using the MQ sample
+programs in bindings mode inside the broker container:
+
+```bash
+# 1. Send a pacs.008 (single-line so amqsput puts it as one string message)
+docker compose exec ibmmq bash -c \
+  '/opt/mqm/samp/bin/amqsput PACS008.IN QM1 < /demo/valid-pacs008-oneline.xml'
+
+# 2. Read the pacs.002 reply the gateway published
+docker compose exec ibmmq /opt/mqm/samp/bin/amqsget PACS002.OUT QM1
+```
+
+You'll see the `ACSC` pacs.002 come back on `PACS002.OUT`. To watch a failure path, stop the
+processor (`docker compose stop processor`) and send again: the message is retried, then lands on
+`DLQ` (read it with `amqsget DLQ QM1`) — tagged with `gateway_dlq_reason`. The MQ web console is at
+<https://localhost:9443/ibmmq/console> (admin / `passw0rd`) if you prefer to watch queue depths.
+
+Gateway and processor metrics are at `http://localhost:8081/actuator/prometheus` and
+`http://localhost:8080/actuator/prometheus`.
+
+---
+
 ## Design decisions
 
 **1. The gateway is payload-agnostic.** It never parses the pacs.008 XML. The contract with the

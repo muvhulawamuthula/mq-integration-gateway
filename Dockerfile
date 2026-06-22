@@ -21,7 +21,8 @@ COPY --from=build /app/target/mq-integration-gateway-*.jar app.jar
 # Target IBM MQ in production.
 ENV SPRING_PROFILES_ACTIVE=mq
 EXPOSE 8081
+# TCP readiness check using bash (no wget/curl in the base image).
 HEALTHCHECK --interval=30s --timeout=3s --start-period=40s \
-  CMD wget -qO- http://localhost:8081/actuator/health | grep -q UP || exit 1
+  CMD bash -c ':</dev/tcp/localhost/8081' || exit 1
 
 ENTRYPOINT ["java", "-jar", "/app/app.jar"]
