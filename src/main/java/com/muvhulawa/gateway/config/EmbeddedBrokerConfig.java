@@ -28,7 +28,10 @@ public class EmbeddedBrokerConfig {
         return configuration -> {
             AddressSettings settings = new AddressSettings()
                     .setDeadLetterAddress(SimpleString.toSimpleString(properties.getQueues().getDeadLetter()))
-                    .setMaxDeliveryAttempts(3)   // initial try + 2 redeliveries, then dead-letter
+                    // High backstop on purpose: the application's delivery-count guard is the
+                    // authoritative limit (so behaviour matches IBM MQ). This only catches a
+                    // pathological case where the app itself cannot route to the DLQ.
+                    .setMaxDeliveryAttempts(25)
                     .setRedeliveryDelay(0);      // no delay — keeps tests fast and dev responsive
             configuration.addAddressSetting("#", settings);
         };

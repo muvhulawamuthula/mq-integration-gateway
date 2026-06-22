@@ -43,21 +43,34 @@ public class Pacs008Listener {
     private final ReplyPublisher replyPublisher;
     private final DeadLetterRouter deadLetterRouter;
     private final GatewayMetrics metrics;
+    private final int maxDeliveryAttempts;
 
     public Pacs008Listener(ProcessorClient processorClient,
                            ReplyPublisher replyPublisher,
                            DeadLetterRouter deadLetterRouter,
-                           GatewayMetrics metrics) {
+                           GatewayMetrics metrics,
+                           com.muvhulawa.gateway.config.GatewayProperties properties) {
         this.processorClient = processorClient;
         this.replyPublisher = replyPublisher;
         this.deadLetterRouter = deadLetterRouter;
         this.metrics = metrics;
+        this.maxDeliveryAttempts = properties.getMaxDeliveryAttempts();
     }
 
     @JmsListener(destination = "${gateway.queues.inbound}", containerFactory = "gatewayListenerFactory")
     public void onMessage(Message message) throws JMSException {
         MDC.put("jmsMsgId", safeId(message));
         try {
+            // A message that has been redelivered past the limit is exhausted poison: stop retrying
+            // (this guard, not the broker, is what bounds redelivery on IBM MQ).
+            int deliveries = deliveryCount(message);
+            if (deliveries > maxDeliveryAttempts) {
+                metrics.deadLettered("exhausted");
+                deadLetterRouter.route(message,
+                        "exhausted after " + (deliveries - 1) + " redeliveries on transient failures");
+                return;
+            }
+
             if (!(message instanceof TextMessage text)) {
                 metrics.deadLettered("non_text");
                 deadLetterRouter.route(message, "non-text JMS message; expected a pacs.008 TextMessage");
@@ -94,6 +107,16 @@ public class Pacs008Listener {
             return message.getJMSMessageID();
         } catch (JMSException e) {
             return "unknown";
+        }
+    }
+
+    /** Delivery attempt number (1 on first delivery). Supported by both Artemis and IBM MQ. */
+    private static int deliveryCount(Message message) {
+        try {
+            return message.propertyExists("JMSXDeliveryCount")
+                    ? message.getIntProperty("JMSXDeliveryCount") : 1;
+        } catch (JMSException e) {
+            return 1;
         }
     }
 }

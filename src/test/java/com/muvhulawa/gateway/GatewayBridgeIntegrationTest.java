@@ -126,11 +126,13 @@ class GatewayBridgeIntegrationTest {
 
         jms.convertAndSend("PACS008.IN", VALID_PACS008);
 
-        // After the broker's delivery attempts are exhausted the original message lands on the DLQ...
+        // After the delivery-count limit is exhausted the message is dead-lettered, tagged with why...
         Message dead = receive("DLQ", 10000);
         assertNotNull(dead, "an exhausted transient message must be dead-lettered");
         assertInstanceOf(TextMessage.class, dead);
         assertTrue(((TextMessage) dead).getText().contains("MSG-1"));
+        assertTrue(dead.getStringProperty("gateway_dlq_reason").contains("exhausted"),
+                "an exhausted transient message should be tagged as such");
         // ...and no business reply was ever produced.
         assertNull(receive("PACS002.OUT", 300));
     }

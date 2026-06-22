@@ -20,10 +20,20 @@ public class GatewayProperties {
     /** JMS listener concurrency, e.g. "1-5" (min-max consumers). */
     private String concurrency = "1-5";
 
+    /**
+     * How many times a message may be delivered before the gateway gives up and dead-letters it
+     * itself. This is applied in application code (on {@code JMSXDeliveryCount}) so poison handling
+     * is identical on every broker — IBM MQ does not auto-requeue a poison message for a generic
+     * JMS consumer the way its JEE container does.
+     */
+    private int maxDeliveryAttempts = 3;
+
     public Queues getQueues() { return queues; }
     public Processor getProcessor() { return processor; }
     public String getConcurrency() { return concurrency; }
     public void setConcurrency(String concurrency) { this.concurrency = concurrency; }
+    public int getMaxDeliveryAttempts() { return maxDeliveryAttempts; }
+    public void setMaxDeliveryAttempts(int maxDeliveryAttempts) { this.maxDeliveryAttempts = maxDeliveryAttempts; }
 
     public static class Queues {
         /** Inbound queue carrying pacs.008 requests. */
