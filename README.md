@@ -1,174 +1,293 @@
 # IBM MQ Integration Gateway
 
-A Spring Boot service that bridges **ISO 20022 `pacs.008`** credit-transfer messages from an
-**IBM MQ** queue to the [ISO 20022 Payment Message Processor](../iso20022-processor) over HTTP,
-and publishes the resulting **`pacs.002`** status report back on a reply queue.
+[![CI](https://github.com/muvhulawamuthula/mq-integration-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/muvhulawamuthula/mq-integration-gateway/actions/workflows/ci.yml)
+![Java](https://img.shields.io/badge/Java-21-blue)
+![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.3-brightgreen)
+![Messaging](https://img.shields.io/badge/IBM%20MQ-JMS-052FAD)
 
-This is the companion ingress to the processor: real interbank traffic does not arrive over HTTP,
-it arrives on a message queue (IBM MQ, SWIFT, a real-time clearing bus). The gateway is the
-adapter that turns "a message on a queue" into "a call to the payment service" — and it is built to
-demonstrate the part that actually matters at that boundary: **what happens when things go wrong.**
+A Spring Boot service that bridges **ISO 20022 `pacs.008`** credit-transfer messages from an **IBM MQ**
+queue to a payment processor over HTTP, and publishes the resulting **`pacs.002`** status report back
+on a reply queue — with transacted consumption, bounded redelivery, and a dead-letter queue for
+poison messages.
 
-```
-  bank / clearing       ┌───────────────────────────┐        ISO 20022 Payment
-  network               │   MQ Integration Gateway   │        Processor (HTTP)
-                        │                            │
-  pacs.008  ──MQ──────► │  @JmsListener (transacted) │ ──POST /pacs008──►  validate
-  (PACS008.IN)          │        │                   │                     settle
-                        │        ▼                   │ ◄──pacs.002 (200)── acknowledge
-                        │  ProcessorClient (HTTP)    │
-  pacs.002  ◄──MQ────── │  ReplyPublisher            │
-  (PACS002.OUT)         │        │                   │
-                        │        ▼ (on failure)      │
-  poison /  ◄──MQ────── │  DeadLetterRouter          │
-  exhausted (DLQ)       └───────────────────────────┘
-```
+> Companion ingress to the **[ISO 20022 Payment Message Processor](https://github.com/muvhulawamuthula/iso20022-processor)**.
+> Real interbank traffic does not arrive over HTTP; it arrives on a message queue (IBM MQ, SWIFT, a
+> real-time clearing bus). This service is the adapter that turns *"a message on a queue"* into *"a
+> call to the payment API"* — and its focus is the part that actually matters at that boundary:
+> **what happens when things go wrong.**
 
 ---
 
-## The three outcomes (the part that matters)
+## Contents
 
-The gateway runs its listener in a **transacted JMS session**, so acknowledgement is tied to the
-outcome of handling the message. That single fact gives three correct behaviours:
+- [Architecture](#architecture)
+- [Message flow & failure semantics](#message-flow--failure-semantics)
+- [Delivery guarantees](#delivery-guarantees)
+- [Getting started](#getting-started)
+- [End-to-end demo with real IBM MQ](#end-to-end-demo-with-real-ibm-mq)
+- [Configuration](#configuration)
+- [Observability](#observability)
+- [Testing](#testing)
+- [Design decisions & trade-offs](#design-decisions--trade-offs)
+- [Production checklist](#production-checklist)
+- [Project structure](#project-structure)
+- [Tech stack](#tech-stack)
 
-| Situation | What the gateway does | Why |
+---
+
+## Architecture
+
+```
+  bank / clearing       ┌────────────────────────────┐        ISO 20022 Payment
+  network               │   MQ Integration Gateway    │        Processor (HTTP)
+                        │                             │
+  pacs.008  ──MQ──────► │  @JmsListener (transacted)  │ ──POST /pacs008──►  validate
+  (PACS008.IN)          │        │                    │                     settle
+                        │        ▼                    │ ◄──pacs.002 (200)── acknowledge
+                        │  ProcessorClient (RestClient)│
+  pacs.002  ◄──MQ────── │  ReplyPublisher              │
+  (PACS002.OUT)         │        │                    │
+                        │        ▼ (on failure)       │
+  poison /  ◄──MQ────── │  DeadLetterRouter            │
+  exhausted (DLQ)       └────────────────────────────┘
+```
+
+The gateway is intentionally **payload-agnostic**: it never parses the pacs.008 XML. The contract
+with the processor is *"valid pacs.008 in, pacs.002 out"*, and request/reply correlation uses JMS
+headers — so a change to the message version touches the processor, not the bridge.
+
+---
+
+## Message flow & failure semantics
+
+The listener runs in a **transacted JMS session**, so message acknowledgement is bound to the
+outcome of handling it. That single property yields three correct behaviours:
+
+| Situation | Action | Rationale |
 |---|---|---|
-| **Success** — processor returns a pacs.002 (incl. a business `RJCT`) | Publish the reply, commit (consume) | A pacs.002 is a *successful* exchange. A business rejection is still an answer worth delivering — not a failure. |
-| **Transient** failure — processor down / 5xx / connection refused | Roll back → broker **redelivers**; after the backout threshold the broker dead-letters it | Retrying may succeed. The processor's **`MsgId` idempotency** makes redelivery safe — a duplicate pacs.008 is deduplicated, never paid twice. |
-| **Permanent** failure — 4xx, or a non-text payload | Route straight to the **DLQ** with a reason tag, commit | Retrying cannot help, and leaving it on the queue would block every message behind it (head-of-line blocking). |
+| **Success** — processor returns a pacs.002 (incl. a business `RJCT`) | Publish the reply, commit (consume) | A pacs.002 is a *successful* exchange. A business rejection is still an answer worth delivering, not a failure. |
+| **Transient** failure — processor down / `5xx` / connection refused | Roll back → **redeliver**; after the delivery-count limit, route to the **DLQ** | Retrying may succeed. The downstream processor's **`MsgId` idempotency** makes redelivery safe — a duplicate pacs.008 is deduplicated, never paid twice. |
+| **Permanent** failure — `4xx`, or a non-text payload | Route straight to the **DLQ** (tagged with a reason), commit | Retrying cannot help, and leaving the message on the queue would block everything behind it (head-of-line blocking). |
 
-The transient/permanent split is the crux: a `pacs.002 RJCT` (business "no") comes back as a normal
-`200` and is published as a reply; only a **transport-level** failure is retried; only a failure
-that *cannot* succeed on retry is dead-lettered immediately.
+The transient/permanent distinction is the crux:
 
-> **Why redelivery is safe here.** The gateway is intentionally at-least-once: it acknowledges only
-> after a successful forward + reply. A crash mid-flight redelivers the message, and the downstream
-> processor's idempotency key absorbs the duplicate. This is the whole reason the two services are
-> designed as a pair.
+- A `pacs.002 RJCT` (a business "no") comes back as a normal `200` and is **published as a reply** —
+  it is not a failure.
+- Only a **transport-level** failure (`5xx`, I/O) is retried.
+- Only a failure that *cannot* succeed on retry (`4xx`, malformed payload) is dead-lettered
+  immediately.
 
----
-
-## Run it
-
-The gateway runs out of the box on an **embedded ActiveMQ Artemis** broker — no IBM MQ needed to
-develop or test it locally. In production it targets IBM MQ via the `mq` profile; the listener and
-publisher code is broker-agnostic Spring JMS and does not change.
-
-```bash
-# 1. Start the processor (companion project) on :8080
-cd ../iso20022-processor && mvn spring-boot:run
-
-# 2. Start the gateway on :8081 (embedded broker, dev profile)
-cd ../mq-integration-gateway && mvn spring-boot:run
-```
-
-Drop a `pacs.008` on `PACS008.IN` and the pacs.002 appears on `PACS002.OUT`; failures land on `DLQ`.
-
-```bash
-mvn test   # 4 integration tests on an embedded broker + a stubbed processor:
-           # forward+reply with correlation, transient->redelivery->DLQ,
-           # permanent->DLQ, and non-text poison->DLQ
-```
-
-### Run it in Docker (production / IBM MQ profile)
-
-```bash
-docker build -t mq-integration-gateway .
-docker run -p 8081:8081 \
-  -e MQ_QMGR=QM1 -e MQ_CHANNEL=DEV.APP.SVRCONN -e MQ_CONN_NAME='mqhost(1414)' \
-  -e MQ_APP_USER=app -e MQ_APP_PASSWORD=*** \
-  mq-integration-gateway     # SPRING_PROFILES_ACTIVE=mq is baked into the image
-```
-
-The gateway bounds redelivery itself (on `JMSXDeliveryCount`), so no MQ-specific config is required
-for poison handling. If you would rather have IBM MQ's JMS client requeue poison messages natively,
-set a backout policy *and* grant the connecting user `+setall` on the backout queue (the requeue
-passes message context):
-
-```
-ALTER QLOCAL(PACS008.IN) BOTHRESH(3) BOQNAME(DLQ)
-SET AUTHREC PROFILE(DLQ) OBJTYPE(QUEUE) PRINCIPAL('app') AUTHADD(SETALL)
-```
+Poison handling (the redelivery limit) is enforced **in application code** on `JMSXDeliveryCount`,
+so it behaves identically on every broker — see [decision 4](#4-broker-agnostic-code-broker-specific-config).
 
 ---
 
-## End-to-end demo with real IBM MQ (`docker compose`)
+## Delivery guarantees
 
-`docker-compose.yml` stands up the whole chain — **IBM MQ**, the **processor**, and the **gateway**
-running on the `mq` profile — and wires them together. It assumes the companion processor repo is a
+The gateway is **at-least-once by design**. It acknowledges the inbound message only after a
+successful forward *and* reply publish; a crash mid-flight redelivers the message. Correctness under
+that redelivery comes from the **downstream processor being idempotent** on the pacs.008 `MsgId`.
+
+This is a deliberate choice over attempting exactly-once across a queue and an HTTP call (a
+distributed-systems trap). Exactly-once-*effect* is available via XA if a deployment truly needs it
+(see [production checklist](#production-checklist)) — at a real throughput and operational cost.
+
+---
+
+## Getting started
+
+### Prerequisites
+
+- JDK 21+
+- Maven 3.9+
+- Docker (only for the [end-to-end demo](#end-to-end-demo-with-real-ibm-mq))
+
+### Run locally (zero external infrastructure)
+
+The `dev` profile (default) starts an **embedded ActiveMQ Artemis** broker in-process, so no IBM MQ
+is needed to run or develop the gateway.
+
+```bash
+# 1. Start the processor (companion repo) on :8080
+git clone https://github.com/muvhulawamuthula/iso20022-processor && \
+  (cd iso20022-processor && mvn spring-boot:run)
+
+# 2. Start the gateway on :8081
+mvn spring-boot:run
+```
+
+Put a `pacs.008` on `PACS008.IN`; the `pacs.002` appears on `PACS002.OUT`, and failures land on `DLQ`.
+
+```bash
+mvn test     # 4 integration tests on an embedded broker (see Testing)
+```
+
+---
+
+## End-to-end demo with real IBM MQ
+
+`docker-compose.yml` stands up the whole chain — **IBM MQ + processor + gateway** (running the `mq`
+profile) — and wires them together. It assumes the companion processor repo is checked out as a
 sibling directory (`../iso20022-processor`).
 
 ```bash
-docker compose up --build      # starts ibmmq, processor, gateway (gateway waits for both to be healthy)
+docker compose up --build      # gateway waits until ibmmq and processor are healthy
 ```
 
-`mq/payments.mqsc` is applied to the queue manager at start-up: it creates `PACS008.IN`,
-`PACS002.OUT`, and `DLQ` and grants the `app` user access.
+`mq/payments.mqsc` is applied at queue-manager start-up: it creates `PACS008.IN`, `PACS002.OUT`, and
+`DLQ` and grants the `app` user access.
 
-**Drive it** — put a pacs.008 on the inbound queue and read the pacs.002 reply, using the MQ sample
-programs in bindings mode inside the broker container:
+**Drive it** using the MQ sample programs in bindings mode inside the broker container:
 
 ```bash
-# 1. Send a pacs.008 (single-line so amqsput puts it as one string message)
+# Send a pacs.008 (single-line so amqsput puts it as one string message)
 docker compose exec ibmmq bash -c \
   '/opt/mqm/samp/bin/amqsput PACS008.IN QM1 < /demo/valid-pacs008-oneline.xml'
 
-# 2. Read the pacs.002 reply the gateway published
+# Read the pacs.002 reply the gateway published
 docker compose exec ibmmq /opt/mqm/samp/bin/amqsget PACS002.OUT QM1
 ```
 
-You'll see the `ACSC` pacs.002 come back on `PACS002.OUT`. To watch a failure path, stop the
-processor (`docker compose stop processor`) and send again: the message is retried, then lands on
-`DLQ` (read it with `amqsget DLQ QM1`) — tagged with `gateway_dlq_reason`. The MQ web console is at
-<https://localhost:9443/ibmmq/console> (admin / `passw0rd`) if you prefer to watch queue depths.
+The reply comes back with group status `ACSC`. To watch a failure path, `docker compose stop
+processor` and send again: the message is retried, then dead-lettered to `DLQ` (read it with
+`amqsget DLQ QM1`) tagged with a `gateway_dlq_reason` property. The MQ web console is at
+<https://localhost:9443/ibmmq/console> (admin / `passw0rd`).
 
-Gateway and processor metrics are at `http://localhost:8081/actuator/prometheus` and
-`http://localhost:8080/actuator/prometheus`.
-
----
-
-## Design decisions
-
-**1. The gateway is payload-agnostic.** It never parses the pacs.008 XML. The contract with the
-processor is just "valid pacs.008 in, pacs.002 out", and correlation uses JMS headers
-(`JMSCorrelationID`, falling back to `JMSMessageID`), not anything dug out of the body. Swapping the
-message version touches the processor, not the bridge.
-
-**2. Transacted consume, not auto-acknowledge.** Auto-ack would lose a message the instant the
-processor hiccuped. A transacted session means a failed forward rolls the consume back so the
-message is still there to retry.
-
-**3. Idempotent downstream over exactly-once transport.** Exactly-once across a queue and an HTTP
-call is a distributed-systems trap. The honest, robust design is at-least-once delivery plus an
-idempotent consumer — which is exactly what the processor provides on `MsgId`.
-
-**4. Broker-agnostic code, broker-specific config.** The same `@JmsListener` / `JmsTemplate` code
-runs on embedded Artemis (dev/test) and IBM MQ (prod). Only the `ConnectionFactory` and the backout
-policy differ, and those live in profile config — `application-dev.yml` vs `application-mq.yml`.
-
-**5. JMS property names are valid Java identifiers.** Status metadata is surfaced as
-`payment_status` / `idempotent_replay` JMS properties (not the processor's hyphenated HTTP header
-names, which JMS forbids) so downstream consumers can route on status without parsing XML.
-
-**6. Observability for an integration point.** Micrometer meters track the reply mix by status, the
-dead-letter count by kind, the transient-retry rate, and processor round-trip latency — exposed at
-`/actuator/prometheus`. Every log line carries the inbound `JMSMessageID` via MDC.
+> **Poison handling on IBM MQ.** The gateway bounds redelivery itself, so no MQ-specific config is
+> required. If you would rather have IBM MQ's JMS client requeue poison messages natively, set a
+> backout policy *and* grant the connecting user `+setall` on the backout queue (the requeue passes
+> message context):
+> ```
+> ALTER QLOCAL(PACS008.IN) BOTHRESH(3) BOQNAME(DLQ)
+> SET AUTHREC PROFILE(DLQ) OBJTYPE(QUEUE) PRINCIPAL('app') AUTHADD(SETALL)
+> ```
 
 ---
 
-## What's next (honest)
+## Configuration
 
-- **XA / two-phase commit** between the consume and the reply publish, if you need the reply and the
-  ack to be atomic. The current design is at-least-once on purpose (see decision 3); XA buys
-  exactly-once-effect at a real throughput and operational cost.
-- **Schema pre-check at the edge** to reject malformed payloads before a network hop, trading a
-  little duplication of the processor's XSD gate for lower downstream load.
-- **Backpressure** tied to processor health (circuit breaker) so a sustained outage stops pulling
-  from the queue rather than spinning on redelivery.
+All settings are externalised. Defaults are sensible for local development; production values are
+supplied via environment variables (see `docker-compose.yml` and `application-mq.yml`).
+
+| Property | Env (compose) | Default | Description |
+|---|---|---|---|
+| `spring.profiles.active` | `SPRING_PROFILES_ACTIVE` | `dev` | `dev` = embedded Artemis; `mq` = IBM MQ |
+| `gateway.queues.inbound` | — | `PACS008.IN` | Inbound pacs.008 request queue |
+| `gateway.queues.reply` | — | `PACS002.OUT` | Default reply queue (used when no `JMSReplyTo`) |
+| `gateway.queues.dead-letter` | — | `DLQ` | Dead-letter queue for poison / exhausted messages |
+| `gateway.processor.base-url` | `GATEWAY_PROCESSOR_BASEURL` | `http://localhost:8080` | Payment processor base URL |
+| `gateway.processor.path` | — | `/api/v1/payments/pacs008` | pacs.008 submission endpoint |
+| `gateway.concurrency` | — | `1-5` | JMS listener concurrency (min-max consumers) |
+| `gateway.max-delivery-attempts` | — | `3` | Redeliveries before the gateway dead-letters a message |
+| `ibm.mq.queue-manager` | `MQ_QMGR` | `QM1` | IBM MQ queue manager (`mq` profile) |
+| `ibm.mq.channel` | `MQ_CHANNEL` | `DEV.APP.SVRCONN` | Server-connection channel |
+| `ibm.mq.conn-name` | `MQ_CONN_NAME` | `localhost(1414)` | `host(port)` of the queue manager |
+| `ibm.mq.user` / `ibm.mq.password` | `MQ_APP_USER` / `MQ_APP_PASSWORD` | `app` / — | Application credentials |
 
 ---
 
-## Stack
+## Observability
+
+Actuator is enabled with a Prometheus endpoint at `http://localhost:8081/actuator/prometheus`. The
+meters are framed around an integration point — not request counts, but message outcomes:
+
+| Meter | Tags | Meaning |
+|---|---|---|
+| `gateway.messages.replied` | `status`, `replay` | Replies published, by processor group status |
+| `gateway.messages.dead_lettered` | `kind` | Dead-letters, by `permanent` / `non_text` / `exhausted` |
+| `gateway.messages.transient_retries` | — | Transient failures that triggered a redelivery |
+| `gateway.processor.roundtrip` | (timer, p50/p95/p99) | Forward → pacs.002 latency |
+
+Every log line for a message carries its inbound `JMSMessageID` via MDC, so a single message is
+traceable across the forward → reply / dead-letter hops.
+
+---
+
+## Testing
+
+```bash
+mvn test
+```
+
+Four integration tests boot the full Spring context against an **embedded Artemis** broker and a
+stubbed processor (an in-JVM `HttpServer`, no extra dependencies), covering every branch of the
+failure model:
+
+| Test | Asserts |
+|---|---|
+| Valid message | Forwarded; pacs.002 published to the reply queue, correlated via `JMSCorrelationID` |
+| Transient failure (`5xx`) | Retried, then dead-lettered with `gateway_dlq_reason=exhausted…`; no reply produced |
+| Permanent failure (`4xx`) | Dead-lettered immediately with a reason; no retries |
+| Non-text payload | Treated as poison and dead-lettered |
+
+The same broker-agnostic code is verified against real IBM MQ via the
+[compose demo](#end-to-end-demo-with-real-ibm-mq).
+
+---
+
+## Design decisions & trade-offs
+
+#### 1. Payload-agnostic bridge
+The gateway never parses the pacs.008 XML. Correlation uses JMS headers (`JMSCorrelationID`, falling
+back to `JMSMessageID`), not anything dug out of the body. The message contract — and any future
+version bump — lives entirely in the processor.
+
+#### 2. Transacted consume, not auto-acknowledge
+Auto-ack would lose a message the instant the processor hiccuped. A transacted session means a
+failed forward rolls the consume back, so the message is still on the queue to retry.
+
+#### 3. Idempotent downstream over exactly-once transport
+At-least-once delivery plus an idempotent consumer is the robust, honest design for a queue→HTTP
+boundary. The processor deduplicates on `MsgId`, which is what makes redelivery safe.
+
+#### 4. Broker-agnostic code, broker-specific config
+The same `@JmsListener` / `JmsTemplate` code runs on embedded Artemis (dev/test) and IBM MQ (prod);
+only the `ConnectionFactory` differs, in profile config. Poison handling is enforced in application
+code on `JMSXDeliveryCount` rather than relying on a broker feature — IBM MQ's JMS-client
+poison-requeue intercepts at the queue's backout threshold and requires extra context authority, so
+leaning on it would make behaviour broker-specific and the failure surface larger.
+
+#### 5. JMS property names are valid Java identifiers
+Status metadata is surfaced as `payment_status` / `idempotent_replay` JMS properties — not the
+processor's hyphenated HTTP header names, which JMS forbids — so downstream consumers can route on
+status without parsing XML.
+
+---
+
+## Production checklist
+
+- [ ] **XA / two-phase commit** between the consume and the reply publish, if the reply and the ack
+      must be atomic. The current design is at-least-once on purpose (decision 3).
+- [ ] **Edge schema pre-check** to reject malformed payloads before a network hop, trading a little
+      duplication of the processor's XSD gate for lower downstream load.
+- [ ] **Circuit breaker** on processor health, so a sustained outage stops pulling from the queue
+      rather than spinning on redelivery.
+- [ ] **Secrets management** for `MQ_APP_PASSWORD` (the demo uses a plain env var).
+- [ ] **TLS** on the MQ channel and the processor HTTP endpoint.
+
+---
+
+## Project structure
+
+```
+src/main/java/com/muvhulawa/gateway
+├── GatewayApplication.java
+├── config/         GatewayProperties, JmsConfig (transacted factory), EmbeddedBrokerConfig (dev/test)
+├── inbound/        Pacs008Listener  — the @JmsListener orchestrating the flow
+├── downstream/     ProcessorClient, ProcessorResponse, Transient/PermanentDownstreamException
+├── outbound/       ReplyPublisher, DeadLetterRouter
+└── observability/  GatewayMetrics
+src/main/resources
+├── application.yml         (defaults; active profile = dev)
+├── application-dev.yml     (embedded Artemis)
+└── application-mq.yml      (IBM MQ)
+mq/payments.mqsc            queue definitions applied by the IBM MQ container
+docker-compose.yml          IBM MQ + processor + gateway
+```
+
+---
+
+## Tech stack
 
 Java 21 · Spring Boot 3.3 · Spring JMS · IBM MQ (`mq-jms-spring-boot-starter`) · embedded ActiveMQ
 Artemis (dev/test) · RestClient · Micrometer / Prometheus · JUnit 5 · Docker · GitHub Actions
