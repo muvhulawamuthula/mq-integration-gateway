@@ -6,7 +6,8 @@ COPY pom.xml .
 RUN mvn -B -q dependency:go-offline
 
 COPY src ./src
-RUN mvn -B -q clean package
+# Tests run in CI (mvn verify); the image build only needs to produce the jar.
+RUN mvn -B clean package -DskipTests
 
 # --- runtime stage: JRE only, non-root ------------------------------------------------------
 FROM eclipse-temurin:21-jre

@@ -80,11 +80,14 @@ docker run -p 8081:8081 \
   mq-integration-gateway     # SPRING_PROFILES_ACTIVE=mq is baked into the image
 ```
 
-On the queue manager, give the inbound queue a backout policy so the broker itself moves poison
-messages aside:
+The gateway bounds redelivery itself (on `JMSXDeliveryCount`), so no MQ-specific config is required
+for poison handling. If you would rather have IBM MQ's JMS client requeue poison messages natively,
+set a backout policy *and* grant the connecting user `+setall` on the backout queue (the requeue
+passes message context):
 
 ```
 ALTER QLOCAL(PACS008.IN) BOTHRESH(3) BOQNAME(DLQ)
+SET AUTHREC PROFILE(DLQ) OBJTYPE(QUEUE) PRINCIPAL('app') AUTHADD(SETALL)
 ```
 
 ---

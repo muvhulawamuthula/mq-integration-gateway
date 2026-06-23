@@ -1,9 +1,12 @@
 * Payment queues for the end-to-end demo. Applied automatically at queue-manager start-up
 * (the IBM MQ container runs every /etc/mqm/*.mqsc file).
 
-* Inbound pacs.008. BOTHRESH/BOQNAME express the backout policy in MQ-native terms; the gateway
-* also enforces a delivery limit in application code, so behaviour is identical on any broker.
-DEFINE QLOCAL('PACS008.IN') BOTHRESH(3) BOQNAME('DLQ') REPLACE
+* Inbound pacs.008. The gateway bounds redelivery in application code (on JMSXDeliveryCount), which
+* is portable across brokers. We therefore set a high backout threshold so IBM MQ's own JMS-client
+* poison-requeue does NOT intercept first — its requeue path passes message context and would need
+* the connecting user to hold +setall on the backout queue. (To use MQ-native handling instead,
+* set BOTHRESH/BOQNAME here and grant 'app' SETALL on DLQ below.)
+DEFINE QLOCAL('PACS008.IN') BOTHRESH(999999999) REPLACE
 
 * Outbound pacs.002 replies.
 DEFINE QLOCAL('PACS002.OUT') REPLACE
