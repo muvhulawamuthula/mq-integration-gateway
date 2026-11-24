@@ -37,8 +37,6 @@ import static org.junit.jupiter.api.Assertions.*;
 @ActiveProfiles("dev")
 class GatewayBridgeIntegrationTest {
 
-    // --- stub processor (JDK HTTP server, no extra dependencies) --------------------------------
-
     record Stub(int code, String paymentStatus, String body) { }
 
     private static final String PACS002_ACSC = """
@@ -85,8 +83,6 @@ class GatewayBridgeIntegrationTest {
     static void stopStub() {
         STUB.stop(0);
     }
-
-    // --- fixtures -------------------------------------------------------------------------------
 
     private static final String VALID_PACS008 = """
             <?xml version="1.0" encoding="UTF-8"?>
@@ -165,8 +161,6 @@ class GatewayBridgeIntegrationTest {
         assertNotNull(reason);
         assertTrue(reason.toLowerCase().contains("non-text"), reason);
     }
-
-    // --- helpers --------------------------------------------------------------------------------
 
     private Message receive(String queue, long timeoutMs) {
         jms.setReceiveTimeout(timeoutMs);
