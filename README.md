@@ -291,3 +291,7 @@ docker-compose.yml          IBM MQ + processor + gateway
 
 Java 21 · Spring Boot 3.3 · Spring JMS · IBM MQ (`mq-jms-spring-boot-starter`) · embedded ActiveMQ
 Artemis (dev/test) · RestClient · Micrometer / Prometheus · JUnit 5 · Docker · GitHub Actions
+
+## License
+
+MIT. See [LICENSE](LICENSE).
